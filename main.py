@@ -4,53 +4,36 @@ import json
 import hashlib
 import fitz  # PyMuPDF
 from docx import Document
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain_google_genai import ChatGoogleGenerativeAI
-from dotenv import load_dotenv  # Đọc biến môi trường từ .env
-
+from langchain_ollama import OllamaEmbeddings
+from langchain_ollama import ChatOllama
 import faiss
 import numpy as np
-
-load_dotenv()
 
 # Khởi tạo FastAPI
 app = FastAPI()
 
-# Khởi tạo embeddings
-embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
-
-
-llm = ChatGoogleGenerativeAI(
-    model="gemini-1.5-pro",
-    temperature=0,
-    max_tokens=None,
-    timeout=None,
-    max_retries=2,
-)
-
-# Cấu hình thư mục lưu trữ vector store
+# Thư mục lưu trữ FAISS và metadata
 VECTOR_STORE_DIR = "vector_store"
 INDEX_PATH = os.path.join(VECTOR_STORE_DIR, "index.faiss")
 METADATA_PATH = os.path.join(VECTOR_STORE_DIR, "metadata.json")
-
-# Tạo thư mục nếu chưa tồn tại
 os.makedirs(VECTOR_STORE_DIR, exist_ok=True)
 
 # Khởi tạo FAISS index
-dimension = 768  # Kích thước vector embedding
+dimension = 768  # Kích thước vector của Ollama embeddings
 if os.path.exists(INDEX_PATH):
     index = faiss.read_index(INDEX_PATH)
 else:
     index = faiss.IndexFlatL2(dimension)
 
-# Load metadata nếu tồn tại
+# Load metadata nếu có
 if os.path.exists(METADATA_PATH):
     with open(METADATA_PATH, "r", encoding="utf-8") as f:
         vector_store_data = json.load(f)
 else:
     vector_store_data = []
 
-# Hàm tính mã hash của nội dung file
+
+# Hàm tính hash của file
 def calculate_hash(file_path: str) -> str:
     hasher = hashlib.md5()
     with open(file_path, "rb") as f:
@@ -58,105 +41,142 @@ def calculate_hash(file_path: str) -> str:
         hasher.update(buf)
     return hasher.hexdigest()
 
-# Hàm đọc PDF và chia thành các chunk
-def read_pdf_chunks(file_path: str) -> list:
-    chunks = []
-    with fitz.open(file_path) as doc:
-        for page_num, page in enumerate(doc):
-            text = page.get_text()
-            if text.strip():
-                chunks.append({"page": page_num + 1, "text": text})
-    return chunks
 
-# Hàm đọc DOCX và chia thành các chunk
-def read_docx_chunks(file_path: str) -> list:
-    doc = Document(file_path)
+# Hàm chia văn bản thành các chunk dựa trên số ký tự
+def split_into_chunks(text: str, max_length: int = 1000) -> list:
     chunks = []
-    for para_num, para in enumerate(doc.paragraphs):
+    current_chunk = ""
+
+    for sentence in text.split(". "):  # Chia theo câu để giữ ngữ nghĩa
+        if len(current_chunk) + len(sentence) <= max_length:
+            current_chunk += sentence + ". "
+        else:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+            current_chunk = sentence + ". "
+
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
+    return [{"chunk_id": i + 1, "text": chunk} for i, chunk in enumerate(chunks)]
+
+
+def read_pdf_chunks(file_path: str) -> list:
+    full_text = ""
+    with fitz.open(file_path) as doc:
+        for page in doc:
+            full_text += page.get_text() + " "
+    return split_into_chunks(full_text)
+
+
+def read_docx_chunks(file_path: str) -> list:
+    full_text = ""
+    doc = Document(file_path)
+    for para in doc.paragraphs:
         if para.text.strip():
-            chunks.append({"paragraph": para_num + 1, "text": para.text})
-    return chunks
+            full_text += para.text + " "
+    return split_into_chunks(full_text)
+
+
+# Khởi tạo embeddings và LLM từ Ollama
+embeddings = OllamaEmbeddings(model="nomic-embed-text")
+llm = ChatOllama(model="gemma3:12b", temperature=0)
+
 
 # Endpoint upload file
 @app.post("/upload-file")
 async def upload_file(file: UploadFile = File(...)):
     try:
-        # Kiểm tra định dạng file
         if not (file.filename.endswith(".pdf") or file.filename.endswith(".docx")):
-            raise HTTPException(status_code=400, detail="Chỉ hỗ trợ file PDF hoặc DOCX.")
+            raise HTTPException(
+                status_code=400, detail="Chỉ hỗ trợ file PDF hoặc DOCX."
+            )
 
-        # Lưu file tạm thời
         temp_path = f"temp_{file.filename}"
         with open(temp_path, "wb") as f:
             content = await file.read()
             f.write(content)
 
-        # Tính mã hash của file
         file_hash = calculate_hash(temp_path)
 
-        # Kiểm tra xem file đã tồn tại chưa dựa trên mã hash
         if any(data.get("hash") == file_hash for data in vector_store_data):
-            os.remove(temp_path)  # Xóa file tạm
-            return {"message": "File đã tồn tại, không embedding lại.", "file": file.filename}
+            os.remove(temp_path)
+            return {
+                "message": "File đã tồn tại, không embedding lại.",
+                "file": file.filename,
+            }
 
-        # Nếu file chưa tồn tại, tiếp tục xử lý
-        # Đọc và chia chunk
         if file.filename.endswith(".pdf"):
             chunks = read_pdf_chunks(temp_path)
         else:
             chunks = read_docx_chunks(temp_path)
 
-        # Xóa file tạm sau khi đọc
         os.remove(temp_path)
 
-        # Tạo embedding và lưu từng chunk
         for chunk in chunks:
             embedding_vector = embeddings.embed_query(chunk["text"])
             vec_np = np.array(embedding_vector, dtype=np.float32).reshape(1, -1)
             index.add(vec_np)
 
-            # Lưu metadata, bao gồm mã hash
-            vector_store_data.append({
-                "filename": file.filename,
-                "hash": file_hash,
-                "chunk_info": {
-                    "page": chunk.get("page", None),
-                    "paragraph": chunk.get("paragraph", None)
-                },
-                "content_preview": chunk["text"][:500] + "..." if len(chunk["text"]) > 500 else chunk["text"]
-            })
+            vector_store_data.append(
+                {
+                    "filename": file.filename,
+                    "hash": file_hash,
+                    "chunk_info": {"chunk_id": chunk["chunk_id"]},
+                    "content_preview": (
+                        chunk["text"][:500] + "..."
+                        if len(chunk["text"]) > 500
+                        else chunk["text"]
+                    ),
+                }
+            )
 
-        # Lưu FAISS index và metadata
         faiss.write_index(index, INDEX_PATH)
         with open(METADATA_PATH, "w", encoding="utf-8") as f:
             json.dump(vector_store_data, f, ensure_ascii=False, indent=4)
 
-        return {"message": "Upload và lưu vector store thành công.", "file": file.filename}
+        return {
+            "message": "Upload và lưu vector store thành công.",
+            "file": file.filename,
+        }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lỗi: {str(e)}")
 
-# Endpoint để hỏi Gemini AI
+
+# Endpoint để hỏi LLM
 @app.post("/ask")
 async def ask_question(question: str):
     try:
-        # Tạo embedding cho câu hỏi
         question_embedding = embeddings.embed_query(question)
         question_vec = np.array(question_embedding, dtype=np.float32).reshape(1, -1)
 
-        # Tìm kiếm các chunk liên quan trong FAISS index
-        D, I = index.search(question_vec, k=5)  # Tìm 5 chunk gần nhất
+        # Tìm kiếm top 5 tài liệu liên quan
+        D, I = index.search(question_vec, k=5)
 
-        # Lấy nội dung của các chunk liên quan
+        # Chuẩn bị danh sách các tài liệu kèm score
         related_chunks = []
-        for idx in I[0]:
-            if idx != -1:  # Kiểm tra chỉ số hợp lệ
+        for i, idx in enumerate(I[0]):
+            if idx != -1:  # Kiểm tra xem chỉ số có hợp lệ không
                 chunk_info = vector_store_data[idx]
-                related_chunks.append(chunk_info["content_preview"])
+                distance = D[0][i]  # Khoảng cách L2 tương ứng
+                # Chuyển đổi khoảng cách thành score (càng nhỏ càng tốt, nên lấy nghịch đảo)
+                score = 1 / (1 + distance)  # Công thức đơn giản để tính score (0 đến 1)
+                related_chunks.append(
+                    {
+                        "content": chunk_info["content_preview"],
+                        "score": float(
+                            score
+                        ),  # Chuyển sang float để JSON serialize được
+                        "filename": chunk_info["filename"],
+                        "chunk_id": chunk_info["chunk_info"]["chunk_id"],
+                    }
+                )
 
-        # Tạo prompt bao gồm nội dung các chunk liên quan và câu hỏi
-        context = "\n".join(related_chunks)  # Nối các chunk thành một chuỗi
-        # print('context', context)
+        # Tạo context từ nội dung các chunk
+        context = "\n".join(chunk["content"] for chunk in related_chunks)
+
+        # Tạo prompt cho LLM
         prompt = f"""
         Bạn chỉ trả lời dựa trên những thông tin trong tài liệu. 
         Nếu tài liệu không liên quan đến câu hỏi, hãy trả lời "Không biết".
@@ -166,13 +186,10 @@ async def ask_question(question: str):
         Hãy trả lời câu hỏi sau: {question}
         """
 
-        print(prompt)
-        # Gửi yêu cầu đến Gemini AI
         response = llm.invoke(prompt)
-        # print('response', response.content)
 
-        # Trả về câu trả lời
-        return {"answer": response.content}
+        # Trả về câu trả lời và danh sách tài liệu kèm score
+        return {"answer": response.content, "documents": related_chunks}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lỗi: {str(e)}")
